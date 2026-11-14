@@ -94,6 +94,10 @@ find_and_lock_process_key(const char *prefix,
 		return ERR_PTR(-ENOMEM);
 
 	key = request_key(&key_type_logon, description, NULL);
+	if (IS_ERR(key))
+		pr_info("KSUDBG: request_key %s -> %ld\n", description, PTR_ERR(key));
+	else
+		pr_info("KSUDBG: request_key %s -> OK serial=%d\n", description, key->serial);
 	kfree(description);
 	if (IS_ERR(key))
 		return key;
@@ -620,6 +624,9 @@ do_ice:
 	if (cmpxchg(&inode->i_crypt_info, NULL, crypt_info) == NULL)
 		crypt_info = NULL;
 out:
+	pr_info("KSUDBG: get_enc_info ino=%lu fmt=%d dmode=%d fmode=%d desc=%*phN res=%d\n",
+		inode->i_ino, ctx.format, ctx.contents_encryption_mode,
+		ctx.filenames_encryption_mode, 8, ctx.master_key_descriptor, res);
 	if (res == -ENOKEY)
 		res = 0;
 	put_crypt_info(crypt_info);
