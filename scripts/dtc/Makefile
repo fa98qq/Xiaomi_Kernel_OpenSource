@@ -24,8 +24,10 @@ HOSTCFLAGS_srcpos.o := $(HOSTCFLAGS_DTC)
 HOSTCFLAGS_treesource.o := $(HOSTCFLAGS_DTC)
 HOSTCFLAGS_util.o := $(HOSTCFLAGS_DTC)
 
-HOSTCFLAGS_dtc-lexer.lex.o := $(HOSTCFLAGS_DTC)
-HOSTCFLAGS_dtc-parser.tab.o := $(HOSTCFLAGS_DTC)
+# gcc >= 10 defaults to -fno-common; the flex lexer and the bison parser both
+# define a tentative `yylloc`, which then collides at link time.
+HOSTCFLAGS_dtc-lexer.lex.o := $(HOSTCFLAGS_DTC) -fcommon
+HOSTCFLAGS_dtc-parser.tab.o := $(HOSTCFLAGS_DTC) -fcommon
 
 # dependencies on generated files need to be listed explicitly
 $(obj)/dtc-lexer.lex.o: $(obj)/dtc-parser.tab.h
