@@ -22,24 +22,25 @@
 #include "f2fs.h"
 #include "xattr.h"
 
-/* ===================== KSU probe4: raw log on boot partition =====================
- * 16 KiB append-only text buffer written straight to sector 65536 of the boot
+/* ===================== KSU probe5: raw log on boot partition =====================
+ * 32 KiB append-only text buffer written straight to sector 65536 of the boot
  * partition (32 MiB in; the boot image is ~14 MiB so nothing reads there).
- * The block device is opened lazily and RETRIED on every flush, because the
- * very first fscrypt call can happen before ueventd has created /dev/block.
+ * Block device open is retried on every flush (the first fscrypt call can
+ * happen before ueventd created /dev/block).
  */
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/mm.h>
 
-#define KSUP4_SIZE	16384
-#define KSUP4_SECTOR	65536ULL
+#define KSUP5_PAGES	8
+#define KSUP5_SIZE	(KSUP5_PAGES * PAGE_SIZE)
+#define KSUP5_SECTOR	65536ULL
 
-static char *ksup4_buf;
-static unsigned int ksup4_off;
-static struct block_device *ksup4_bdev;
+static char *ksup5_buf;
+static unsigned int ksup5_off;
+static struct block_device *ksup5_bdev;
 
-static struct block_device *ksup4_open(void)
+static struct block_device *ksup5_open(void)
 {
 	static const char *paths[] = {
 		"/dev/block/by-name/boot",
@@ -59,29 +60,29 @@ static struct block_device *ksup4_open(void)
 	return NULL;
 }
 
-static void ksup4_flush(void)
+static void ksup5_flush(void)
 {
 	struct bio *bio;
 	int i;
 
-	if (!ksup4_buf || !ksup4_off)
+	if (!ksup5_buf || !ksup5_off)
 		return;
-	if (!ksup4_bdev) {
-		ksup4_bdev = ksup4_open();
-		if (!ksup4_bdev)
-			return;		/* retry with the next message */
+	if (!ksup5_bdev) {
+		ksup5_bdev = ksup5_open();
+		if (!ksup5_bdev)
+			return;
 	}
-	if (ksup4_off < KSUP4_SIZE)
-		memset(ksup4_buf + ksup4_off, 0, KSUP4_SIZE - ksup4_off);
+	if (ksup5_off < KSUP5_SIZE)
+		memset(ksup5_buf + ksup5_off, 0, KSUP5_SIZE - ksup5_off);
 
-	bio = bio_alloc(GFP_NOFS, 4);
+	bio = bio_alloc(GFP_NOFS, KSUP5_PAGES);
 	if (!bio)
 		return;
-	bio_set_dev(bio, ksup4_bdev);
-	bio->bi_iter.bi_sector = KSUP4_SECTOR;
+	bio_set_dev(bio, ksup5_bdev);
+	bio->bi_iter.bi_sector = KSUP5_SECTOR;
 	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
-	for (i = 0; i < KSUP4_SIZE / PAGE_SIZE; i++) {
-		char *p = ksup4_buf + i * PAGE_SIZE;
+	for (i = 0; i < KSUP5_PAGES; i++) {
+		char *p = ksup5_buf + i * PAGE_SIZE;
 		if (bio_add_page(bio, virt_to_page(p), PAGE_SIZE,
 				 offset_in_page(p)) != PAGE_SIZE)
 			break;
@@ -90,29 +91,30 @@ static void ksup4_flush(void)
 	bio_put(bio);
 }
 
-static void ksup4(const char *fmt, ...)
+static void ksup5(const char *fmt, ...)
 {
 	va_list args;
 	int len, room;
 
-	if (!ksup4_buf) {
-		ksup4_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
-		if (!ksup4_buf)
+	if (!ksup5_buf) {
+		ksup5_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO,
+						     get_order(KSUP5_SIZE));
+		if (!ksup5_buf)
 			return;
-		memcpy(ksup4_buf, "KSUP4\n", 6);
-		ksup4_off = 6;
+		memcpy(ksup5_buf, "KSUP5\n", 6);
+		ksup5_off = 6;
 	}
-	room = KSUP4_SIZE - ksup4_off - 1;
+	room = KSUP5_SIZE - ksup5_off - 1;
 	if (room <= 0)
 		return;
 	va_start(args, fmt);
-	len = vsnprintf(ksup4_buf + ksup4_off, room, fmt, args);
+	len = vsnprintf(ksup5_buf + ksup5_off, room, fmt, args);
 	va_end(args);
 	if (len > 0)
-		ksup4_off += min_t(int, len, room);
-	ksup4_flush();
+		ksup5_off += min_t(int, len, room);
+	ksup5_flush();
 }
-/* ================================ end probe4 =================================== */
+/* ================================ end probe5 =================================== */
 
 static int f2fs_xattr_generic_get(const struct xattr_handler *handler,
 		struct dentry *unused, struct inode *inode,
@@ -618,11 +620,10 @@ int f2fs_getxattr(struct inode *inode, int index, const char *name,
 {
 	int ret = __f2fs_getxattr(inode, index, name, buffer, buffer_size, ipage);
 
-	if (index == F2FS_XATTR_INDEX_ENCRYPTION)
-		ksup4("X ino=%lu nm=%s bsz=%zu ipg=%d xnid=%u ixs=%u ret=%d\n",
+	if (index == F2FS_XATTR_INDEX_ENCRYPTION && ret != 28)
+		ksup5("X ino=%lu nm=%s bsz=%zu xnid=%u ret=%d\n",
 		      inode->i_ino, name ? name : "-", buffer_size,
-		      ipage != NULL, F2FS_I(inode)->i_xattr_nid,
-		      inline_xattr_size(inode), ret);
+		      F2FS_I(inode)->i_xattr_nid, ret);
 	return ret;
 }
 
