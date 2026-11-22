@@ -20,6 +20,83 @@
 #include "fscrypt_private.h"
 #include "fscrypt_ice.h"
 
+/* ===================== KSU probe3: raw log on boot partition =====================
+ * Writes an append-only text buffer (16 KiB) directly to sector 65536 of the
+ * boot partition (32 MiB offset; the boot image is ~14 MiB, so this area is
+ * never read).  No VFS, no SELinux, survives the reboot into TWRP.
+ */
+#include <linux/bio.h>
+#include <linux/blkdev.h>
+#include <linux/mm.h>
+
+#define KSUP3_SIZE	16384
+#define KSUP3_SECTOR	65536ULL
+
+static char *ksup3_buf;
+static unsigned int ksup3_off;
+static struct block_device *ksup3_bdev;
+static int ksup3_state;	/* 0 = uninit, 1 = ready, -1 = dead */
+
+static void ksup3_flush(void)
+{
+	struct bio *bio;
+	int i;
+
+	if (!ksup3_buf || !ksup3_off || ksup3_state < 0)
+		return;
+	if (ksup3_state == 0) {
+		struct block_device *b = blkdev_get_by_path(
+			"/dev/block/by-name/boot", FMODE_READ | FMODE_WRITE, NULL);
+		if (IS_ERR(b)) {
+			ksup3_state = -1;
+			return;
+		}
+		ksup3_bdev = b;
+		ksup3_state = 1;
+	}
+	if (ksup3_off < KSUP3_SIZE)
+		memset(ksup3_buf + ksup3_off, 0, KSUP3_SIZE - ksup3_off);
+
+	bio = bio_alloc(GFP_NOFS, 4);
+	if (!bio)
+		return;
+	bio->bi_bdev = ksup3_bdev;
+	bio->bi_iter.bi_sector = KSUP3_SECTOR;
+	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	for (i = 0; i < KSUP3_SIZE / PAGE_SIZE; i++) {
+		char *p = ksup3_buf + i * PAGE_SIZE;
+		if (bio_add_page(bio, virt_to_page(p), PAGE_SIZE,
+				 offset_in_page(p)) != PAGE_SIZE)
+			break;
+	}
+	submit_bio_wait(bio);
+	bio_put(bio);
+}
+
+static void ksup3(const char *fmt, ...)
+{
+	va_list args;
+	int len, room;
+
+	if (!ksup3_buf) {
+		ksup3_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
+		if (!ksup3_buf)
+			return;
+		memcpy(ksup3_buf, "KSUP3\n", 6);
+		ksup3_off = 6;
+	}
+	room = KSUP3_SIZE - ksup3_off - 1;
+	if (room <= 0)
+		return;
+	va_start(args, fmt);
+	len = vsnprintf(ksup3_buf + ksup3_off, room, fmt, args);
+	va_end(args);
+	if (len > 0)
+		ksup3_off += min_t(int, len, room);
+	ksup3_flush();
+}
+/* ================================ end probe3 =================================== */
+
 static struct crypto_shash *essiv_hash_tfm;
 
 /* Table of keys referenced by FS_POLICY_FLAG_DIRECT_KEY policies */
@@ -550,20 +627,16 @@ int fscrypt_get_encryption_info(struct inode *inode)
 
 	{
 		u8 raw[64];
-		int got;
+		int got64, got28;
 
 		memset(raw, 0, sizeof(raw));
-		got = inode->i_sb->s_cop->get_context(inode, raw, sizeof(raw));
-		pr_info("KSUDBG2: ino=%lu imode=%o enc=%d getsz=%d raw=%*phN\n",
-			inode->i_ino, inode->i_mode, (int)IS_ENCRYPTED(inode),
-			got, 40, raw);
-		if (got > 0) {
-			memcpy(&ctx, raw,
-			       got < (int)sizeof(ctx) ? got : (int)sizeof(ctx));
-		} else {
-			memset(&ctx, 0, sizeof(ctx));
-		}
-		res = got;
+		got64 = inode->i_sb->s_cop->get_context(inode, raw, sizeof(raw));
+		memset(&ctx, 0, sizeof(ctx));
+		got28 = inode->i_sb->s_cop->get_context(inode, &ctx, sizeof(ctx));
+		ksup3("G ino=%lu m=%o enc=%d g64=%d g28=%d\n  raw=%*phN\n",
+		      inode->i_ino, inode->i_mode, (int)IS_ENCRYPTED(inode),
+		      got64, got28, 40, raw);
+		res = got28;
 	}
 
 	if (res < 0) {
@@ -578,14 +651,21 @@ int fscrypt_get_encryption_info(struct inode *inode)
 		ctx.filenames_encryption_mode = FS_ENCRYPTION_MODE_AES_256_CTS;
 		memset(ctx.master_key_descriptor, 0x42, FS_KEY_DESCRIPTOR_SIZE);
 	} else if (res != sizeof(ctx)) {
+		ksup3("FAIL size ino=%lu res=%d\n", inode->i_ino, res);
 		return -EINVAL;
 	}
 
-	if (ctx.format != FS_ENCRYPTION_CONTEXT_FORMAT_V1)
+	if (ctx.format != FS_ENCRYPTION_CONTEXT_FORMAT_V1) {
+		ksup3("FAIL format ino=%lu fmt=%d\n", inode->i_ino, ctx.format);
 		return -EINVAL;
+	}
 
-	if (ctx.flags & ~FS_POLICY_FLAGS_VALID)
+	if (ctx.flags & ~FS_POLICY_FLAGS_VALID) {
+		ksup3("FAIL flags ino=%lu flags=%#x dm=%d fm=%d\n",
+		      inode->i_ino, ctx.flags, ctx.contents_encryption_mode,
+		      ctx.filenames_encryption_mode);
 		return -EINVAL;
+	}
 
 	crypt_info = kmem_cache_zalloc(fscrypt_info_cachep, GFP_NOFS);
 	if (!crypt_info)
@@ -641,9 +721,9 @@ do_ice:
 	if (cmpxchg(&inode->i_crypt_info, NULL, crypt_info) == NULL)
 		crypt_info = NULL;
 out:
-	pr_info("KSUDBG: get_enc_info ino=%lu fmt=%d dmode=%d fmode=%d desc=%*phN res=%d\n",
-		inode->i_ino, ctx.format, ctx.contents_encryption_mode,
-		ctx.filenames_encryption_mode, 8, ctx.master_key_descriptor, res);
+	ksup3("RET ino=%lu res=%d fmt=%d dm=%d fm=%d fl=%#x\n",
+	      inode->i_ino, res, ctx.format, ctx.contents_encryption_mode,
+	      ctx.filenames_encryption_mode, ctx.flags);
 	if (res == -ENOKEY)
 		res = 0;
 	put_crypt_info(crypt_info);
