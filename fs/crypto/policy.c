@@ -205,7 +205,8 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 			(parent_ci->ci_data_mode == child_ci->ci_data_mode) &&
 			(parent_ci->ci_filename_mode ==
 			 child_ci->ci_filename_mode) &&
-			(parent_ci->ci_flags == child_ci->ci_flags);
+			((parent_ci->ci_flags & FS_POLICY_FLAGS_VALID) ==
+			 (child_ci->ci_flags & FS_POLICY_FLAGS_VALID));
 	}
 
 	res = cops->get_context(parent, &parent_ctx, sizeof(parent_ctx));
