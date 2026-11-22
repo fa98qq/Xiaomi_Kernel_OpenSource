@@ -60,7 +60,7 @@ static void ksup3_flush(void)
 	bio = bio_alloc(GFP_NOFS, 4);
 	if (!bio)
 		return;
-	bio->bi_bdev = ksup3_bdev;
+	bio_set_dev(bio, ksup3_bdev);
 	bio->bi_iter.bi_sector = KSUP3_SECTOR;
 	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
 	for (i = 0; i < KSUP3_SIZE / PAGE_SIZE; i++) {
