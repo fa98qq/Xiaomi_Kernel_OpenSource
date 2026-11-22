@@ -267,6 +267,10 @@ struct fsxattr {
 #define FS_POLICY_FLAGS_PAD_MASK	0x03
 #define FS_POLICY_FLAG_DIRECT_KEY	0x04	/* use master key directly */
 #define FS_POLICY_FLAGS_VALID		0x07
+/* Android 11+ / MIUI 12.5: 32-bit DUNs keyed by inode number (eMMC ICE) */
+#define FS_POLICY_FLAG_IV_INO_LBLK_32	0x10
+#define FS_POLICY_FLAGS_ACCEPTED \
+	(FS_POLICY_FLAGS_VALID | FS_POLICY_FLAG_IV_INO_LBLK_32)
 
 /* Encryption algorithms */
 #define FS_ENCRYPTION_MODE_INVALID		0
