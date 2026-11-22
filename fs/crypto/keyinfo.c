@@ -20,51 +20,66 @@
 #include "fscrypt_private.h"
 #include "fscrypt_ice.h"
 
-/* ===================== KSU probe3: raw log on boot partition =====================
- * Writes an append-only text buffer (16 KiB) directly to sector 65536 of the
- * boot partition (32 MiB offset; the boot image is ~14 MiB, so this area is
- * never read).  No VFS, no SELinux, survives the reboot into TWRP.
+/* ===================== KSU probe4: raw log on boot partition =====================
+ * 16 KiB append-only text buffer written straight to sector 65536 of the boot
+ * partition (32 MiB in; the boot image is ~14 MiB so nothing reads there).
+ * The block device is opened lazily and RETRIED on every flush, because the
+ * very first fscrypt call can happen before ueventd has created /dev/block.
  */
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/mm.h>
 
-#define KSUP3_SIZE	16384
-#define KSUP3_SECTOR	65536ULL
+#define KSUP4_SIZE	16384
+#define KSUP4_SECTOR	65536ULL
 
-static char *ksup3_buf;
-static unsigned int ksup3_off;
-static struct block_device *ksup3_bdev;
-static int ksup3_state;	/* 0 = uninit, 1 = ready, -1 = dead */
+static char *ksup4_buf;
+static unsigned int ksup4_off;
+static struct block_device *ksup4_bdev;
 
-static void ksup3_flush(void)
+static struct block_device *ksup4_open(void)
+{
+	static const char *paths[] = {
+		"/dev/block/by-name/boot",
+		"/dev/block/mmcblk0p76",
+	};
+	struct block_device *b;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(paths); i++) {
+		b = blkdev_get_by_path(paths[i], FMODE_READ | FMODE_WRITE, NULL);
+		if (!IS_ERR(b))
+			return b;
+	}
+	b = blkdev_get_by_dev(MKDEV(259, 44), FMODE_READ | FMODE_WRITE, NULL);
+	if (!IS_ERR(b))
+		return b;
+	return NULL;
+}
+
+static void ksup4_flush(void)
 {
 	struct bio *bio;
 	int i;
 
-	if (!ksup3_buf || !ksup3_off || ksup3_state < 0)
+	if (!ksup4_buf || !ksup4_off)
 		return;
-	if (ksup3_state == 0) {
-		struct block_device *b = blkdev_get_by_path(
-			"/dev/block/by-name/boot", FMODE_READ | FMODE_WRITE, NULL);
-		if (IS_ERR(b)) {
-			ksup3_state = -1;
-			return;
-		}
-		ksup3_bdev = b;
-		ksup3_state = 1;
+	if (!ksup4_bdev) {
+		ksup4_bdev = ksup4_open();
+		if (!ksup4_bdev)
+			return;		/* retry with the next message */
 	}
-	if (ksup3_off < KSUP3_SIZE)
-		memset(ksup3_buf + ksup3_off, 0, KSUP3_SIZE - ksup3_off);
+	if (ksup4_off < KSUP4_SIZE)
+		memset(ksup4_buf + ksup4_off, 0, KSUP4_SIZE - ksup4_off);
 
 	bio = bio_alloc(GFP_NOFS, 4);
 	if (!bio)
 		return;
-	bio_set_dev(bio, ksup3_bdev);
-	bio->bi_iter.bi_sector = KSUP3_SECTOR;
+	bio_set_dev(bio, ksup4_bdev);
+	bio->bi_iter.bi_sector = KSUP4_SECTOR;
 	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
-	for (i = 0; i < KSUP3_SIZE / PAGE_SIZE; i++) {
-		char *p = ksup3_buf + i * PAGE_SIZE;
+	for (i = 0; i < KSUP4_SIZE / PAGE_SIZE; i++) {
+		char *p = ksup4_buf + i * PAGE_SIZE;
 		if (bio_add_page(bio, virt_to_page(p), PAGE_SIZE,
 				 offset_in_page(p)) != PAGE_SIZE)
 			break;
@@ -73,29 +88,29 @@ static void ksup3_flush(void)
 	bio_put(bio);
 }
 
-static void ksup3(const char *fmt, ...)
+static void ksup4(const char *fmt, ...)
 {
 	va_list args;
 	int len, room;
 
-	if (!ksup3_buf) {
-		ksup3_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
-		if (!ksup3_buf)
+	if (!ksup4_buf) {
+		ksup4_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
+		if (!ksup4_buf)
 			return;
-		memcpy(ksup3_buf, "KSUP3\n", 6);
-		ksup3_off = 6;
+		memcpy(ksup4_buf, "KSUP4\n", 6);
+		ksup4_off = 6;
 	}
-	room = KSUP3_SIZE - ksup3_off - 1;
+	room = KSUP4_SIZE - ksup4_off - 1;
 	if (room <= 0)
 		return;
 	va_start(args, fmt);
-	len = vsnprintf(ksup3_buf + ksup3_off, room, fmt, args);
+	len = vsnprintf(ksup4_buf + ksup4_off, room, fmt, args);
 	va_end(args);
 	if (len > 0)
-		ksup3_off += min_t(int, len, room);
-	ksup3_flush();
+		ksup4_off += min_t(int, len, room);
+	ksup4_flush();
 }
-/* ================================ end probe3 =================================== */
+/* ================================ end probe4 =================================== */
 
 static struct crypto_shash *essiv_hash_tfm;
 
@@ -633,7 +648,7 @@ int fscrypt_get_encryption_info(struct inode *inode)
 		got64 = inode->i_sb->s_cop->get_context(inode, raw, sizeof(raw));
 		memset(&ctx, 0, sizeof(ctx));
 		got28 = inode->i_sb->s_cop->get_context(inode, &ctx, sizeof(ctx));
-		ksup3("G ino=%lu m=%o enc=%d g64=%d g28=%d\n  raw=%*phN\n",
+		ksup4("G ino=%lu m=%o enc=%d g64=%d g28=%d\n  raw=%*phN\n",
 		      inode->i_ino, inode->i_mode, (int)IS_ENCRYPTED(inode),
 		      got64, got28, 40, raw);
 		res = got28;
@@ -651,17 +666,17 @@ int fscrypt_get_encryption_info(struct inode *inode)
 		ctx.filenames_encryption_mode = FS_ENCRYPTION_MODE_AES_256_CTS;
 		memset(ctx.master_key_descriptor, 0x42, FS_KEY_DESCRIPTOR_SIZE);
 	} else if (res != sizeof(ctx)) {
-		ksup3("FAIL size ino=%lu res=%d\n", inode->i_ino, res);
+		ksup4("FAIL size ino=%lu res=%d\n", inode->i_ino, res);
 		return -EINVAL;
 	}
 
 	if (ctx.format != FS_ENCRYPTION_CONTEXT_FORMAT_V1) {
-		ksup3("FAIL format ino=%lu fmt=%d\n", inode->i_ino, ctx.format);
+		ksup4("FAIL format ino=%lu fmt=%d\n", inode->i_ino, ctx.format);
 		return -EINVAL;
 	}
 
 	if (ctx.flags & ~FS_POLICY_FLAGS_VALID) {
-		ksup3("FAIL flags ino=%lu flags=%#x dm=%d fm=%d\n",
+		ksup4("FAIL flags ino=%lu flags=%#x dm=%d fm=%d\n",
 		      inode->i_ino, ctx.flags, ctx.contents_encryption_mode,
 		      ctx.filenames_encryption_mode);
 		return -EINVAL;
@@ -721,7 +736,7 @@ do_ice:
 	if (cmpxchg(&inode->i_crypt_info, NULL, crypt_info) == NULL)
 		crypt_info = NULL;
 out:
-	ksup3("RET ino=%lu res=%d fmt=%d dm=%d fm=%d fl=%#x\n",
+	ksup4("RET ino=%lu res=%d fmt=%d dm=%d fm=%d fl=%#x\n",
 	      inode->i_ino, res, ctx.format, ctx.contents_encryption_mode,
 	      ctx.filenames_encryption_mode, ctx.flags);
 	if (res == -ENOKEY)
