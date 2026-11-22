@@ -22,51 +22,66 @@
 #include "f2fs.h"
 #include "xattr.h"
 
-/* ===================== KSU probe3: raw log on boot partition =====================
- * Writes an append-only text buffer (16 KiB) directly to sector 65536 of the
- * boot partition (32 MiB offset; the boot image is ~14 MiB, so this area is
- * never read).  No VFS, no SELinux, survives the reboot into TWRP.
+/* ===================== KSU probe4: raw log on boot partition =====================
+ * 16 KiB append-only text buffer written straight to sector 65536 of the boot
+ * partition (32 MiB in; the boot image is ~14 MiB so nothing reads there).
+ * The block device is opened lazily and RETRIED on every flush, because the
+ * very first fscrypt call can happen before ueventd has created /dev/block.
  */
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/mm.h>
 
-#define KSUP3_SIZE	16384
-#define KSUP3_SECTOR	65536ULL
+#define KSUP4_SIZE	16384
+#define KSUP4_SECTOR	65536ULL
 
-static char *ksup3_buf;
-static unsigned int ksup3_off;
-static struct block_device *ksup3_bdev;
-static int ksup3_state;	/* 0 = uninit, 1 = ready, -1 = dead */
+static char *ksup4_buf;
+static unsigned int ksup4_off;
+static struct block_device *ksup4_bdev;
 
-static void ksup3_flush(void)
+static struct block_device *ksup4_open(void)
+{
+	static const char *paths[] = {
+		"/dev/block/by-name/boot",
+		"/dev/block/mmcblk0p76",
+	};
+	struct block_device *b;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(paths); i++) {
+		b = blkdev_get_by_path(paths[i], FMODE_READ | FMODE_WRITE, NULL);
+		if (!IS_ERR(b))
+			return b;
+	}
+	b = blkdev_get_by_dev(MKDEV(259, 44), FMODE_READ | FMODE_WRITE, NULL);
+	if (!IS_ERR(b))
+		return b;
+	return NULL;
+}
+
+static void ksup4_flush(void)
 {
 	struct bio *bio;
 	int i;
 
-	if (!ksup3_buf || !ksup3_off || ksup3_state < 0)
+	if (!ksup4_buf || !ksup4_off)
 		return;
-	if (ksup3_state == 0) {
-		struct block_device *b = blkdev_get_by_path(
-			"/dev/block/by-name/boot", FMODE_READ | FMODE_WRITE, NULL);
-		if (IS_ERR(b)) {
-			ksup3_state = -1;
-			return;
-		}
-		ksup3_bdev = b;
-		ksup3_state = 1;
+	if (!ksup4_bdev) {
+		ksup4_bdev = ksup4_open();
+		if (!ksup4_bdev)
+			return;		/* retry with the next message */
 	}
-	if (ksup3_off < KSUP3_SIZE)
-		memset(ksup3_buf + ksup3_off, 0, KSUP3_SIZE - ksup3_off);
+	if (ksup4_off < KSUP4_SIZE)
+		memset(ksup4_buf + ksup4_off, 0, KSUP4_SIZE - ksup4_off);
 
 	bio = bio_alloc(GFP_NOFS, 4);
 	if (!bio)
 		return;
-	bio_set_dev(bio, ksup3_bdev);
-	bio->bi_iter.bi_sector = KSUP3_SECTOR;
+	bio_set_dev(bio, ksup4_bdev);
+	bio->bi_iter.bi_sector = KSUP4_SECTOR;
 	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
-	for (i = 0; i < KSUP3_SIZE / PAGE_SIZE; i++) {
-		char *p = ksup3_buf + i * PAGE_SIZE;
+	for (i = 0; i < KSUP4_SIZE / PAGE_SIZE; i++) {
+		char *p = ksup4_buf + i * PAGE_SIZE;
 		if (bio_add_page(bio, virt_to_page(p), PAGE_SIZE,
 				 offset_in_page(p)) != PAGE_SIZE)
 			break;
@@ -75,29 +90,29 @@ static void ksup3_flush(void)
 	bio_put(bio);
 }
 
-static void ksup3(const char *fmt, ...)
+static void ksup4(const char *fmt, ...)
 {
 	va_list args;
 	int len, room;
 
-	if (!ksup3_buf) {
-		ksup3_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
-		if (!ksup3_buf)
+	if (!ksup4_buf) {
+		ksup4_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
+		if (!ksup4_buf)
 			return;
-		memcpy(ksup3_buf, "KSUP3\n", 6);
-		ksup3_off = 6;
+		memcpy(ksup4_buf, "KSUP4\n", 6);
+		ksup4_off = 6;
 	}
-	room = KSUP3_SIZE - ksup3_off - 1;
+	room = KSUP4_SIZE - ksup4_off - 1;
 	if (room <= 0)
 		return;
 	va_start(args, fmt);
-	len = vsnprintf(ksup3_buf + ksup3_off, room, fmt, args);
+	len = vsnprintf(ksup4_buf + ksup4_off, room, fmt, args);
 	va_end(args);
 	if (len > 0)
-		ksup3_off += min_t(int, len, room);
-	ksup3_flush();
+		ksup4_off += min_t(int, len, room);
+	ksup4_flush();
 }
-/* ================================ end probe3 =================================== */
+/* ================================ end probe4 =================================== */
 
 static int f2fs_xattr_generic_get(const struct xattr_handler *handler,
 		struct dentry *unused, struct inode *inode,
@@ -604,7 +619,7 @@ int f2fs_getxattr(struct inode *inode, int index, const char *name,
 	int ret = __f2fs_getxattr(inode, index, name, buffer, buffer_size, ipage);
 
 	if (index == F2FS_XATTR_INDEX_ENCRYPTION)
-		ksup3("X ino=%lu nm=%s bsz=%zu ipg=%d xnid=%u ixs=%u ret=%d\n",
+		ksup4("X ino=%lu nm=%s bsz=%zu ipg=%d xnid=%u ixs=%u ret=%d\n",
 		      inode->i_ino, name ? name : "-", buffer_size,
 		      ipage != NULL, F2FS_I(inode)->i_xattr_nid,
 		      inline_xattr_size(inode), ret);
