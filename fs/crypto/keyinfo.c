@@ -681,7 +681,7 @@ int fscrypt_get_encryption_info(struct inode *inode)
 		return -EINVAL;
 	}
 
-	if (ctx.flags & ~FS_POLICY_FLAGS_VALID) {
+	if (ctx.flags & ~FS_POLICY_FLAGS_ACCEPTED) {
 		ksup5("FAIL flags ino=%lu flags=%#x dm=%d fm=%d\n",
 		      inode->i_ino, ctx.flags, ctx.contents_encryption_mode,
 		      ctx.filenames_encryption_mode);
@@ -692,7 +692,13 @@ int fscrypt_get_encryption_info(struct inode *inode)
 	if (!crypt_info)
 		return -ENOMEM;
 
-	crypt_info->ci_flags = ctx.flags;
+	/* 0x10 (IV_INO_LBLK_32) is only a DUN-derivation hint; keep it out of
+	 * ci_flags so fscrypt_has_permitted_context() compares parent (0x00)
+	 * and child (0x10) policies as equal. */
+	crypt_info->ci_flags = ctx.flags & FS_POLICY_FLAGS_VALID;
+	ksup5("CI ino=%lu mode=%o raw_flags=%#x ci_flags=%#x dm=%d fm=%d\n",
+	      inode->i_ino, inode->i_mode, ctx.flags, crypt_info->ci_flags,
+	      ctx.contents_encryption_mode, ctx.filenames_encryption_mode);
 	crypt_info->ci_data_mode = ctx.contents_encryption_mode;
 	crypt_info->ci_filename_mode = ctx.filenames_encryption_mode;
 	memcpy(crypt_info->ci_master_key_descriptor, ctx.master_key_descriptor,
