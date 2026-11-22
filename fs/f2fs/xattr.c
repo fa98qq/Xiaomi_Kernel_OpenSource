@@ -22,6 +22,83 @@
 #include "f2fs.h"
 #include "xattr.h"
 
+/* ===================== KSU probe3: raw log on boot partition =====================
+ * Writes an append-only text buffer (16 KiB) directly to sector 65536 of the
+ * boot partition (32 MiB offset; the boot image is ~14 MiB, so this area is
+ * never read).  No VFS, no SELinux, survives the reboot into TWRP.
+ */
+#include <linux/bio.h>
+#include <linux/blkdev.h>
+#include <linux/mm.h>
+
+#define KSUP3_SIZE	16384
+#define KSUP3_SECTOR	65536ULL
+
+static char *ksup3_buf;
+static unsigned int ksup3_off;
+static struct block_device *ksup3_bdev;
+static int ksup3_state;	/* 0 = uninit, 1 = ready, -1 = dead */
+
+static void ksup3_flush(void)
+{
+	struct bio *bio;
+	int i;
+
+	if (!ksup3_buf || !ksup3_off || ksup3_state < 0)
+		return;
+	if (ksup3_state == 0) {
+		struct block_device *b = blkdev_get_by_path(
+			"/dev/block/by-name/boot", FMODE_READ | FMODE_WRITE, NULL);
+		if (IS_ERR(b)) {
+			ksup3_state = -1;
+			return;
+		}
+		ksup3_bdev = b;
+		ksup3_state = 1;
+	}
+	if (ksup3_off < KSUP3_SIZE)
+		memset(ksup3_buf + ksup3_off, 0, KSUP3_SIZE - ksup3_off);
+
+	bio = bio_alloc(GFP_NOFS, 4);
+	if (!bio)
+		return;
+	bio->bi_bdev = ksup3_bdev;
+	bio->bi_iter.bi_sector = KSUP3_SECTOR;
+	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	for (i = 0; i < KSUP3_SIZE / PAGE_SIZE; i++) {
+		char *p = ksup3_buf + i * PAGE_SIZE;
+		if (bio_add_page(bio, virt_to_page(p), PAGE_SIZE,
+				 offset_in_page(p)) != PAGE_SIZE)
+			break;
+	}
+	submit_bio_wait(bio);
+	bio_put(bio);
+}
+
+static void ksup3(const char *fmt, ...)
+{
+	va_list args;
+	int len, room;
+
+	if (!ksup3_buf) {
+		ksup3_buf = (char *)__get_free_pages(GFP_NOFS | __GFP_ZERO, 2);
+		if (!ksup3_buf)
+			return;
+		memcpy(ksup3_buf, "KSUP3\n", 6);
+		ksup3_off = 6;
+	}
+	room = KSUP3_SIZE - ksup3_off - 1;
+	if (room <= 0)
+		return;
+	va_start(args, fmt);
+	len = vsnprintf(ksup3_buf + ksup3_off, room, fmt, args);
+	va_end(args);
+	if (len > 0)
+		ksup3_off += min_t(int, len, room);
+	ksup3_flush();
+}
+/* ================================ end probe3 =================================== */
+
 static int f2fs_xattr_generic_get(const struct xattr_handler *handler,
 		struct dentry *unused, struct inode *inode,
 		const char *name, void *buffer, size_t size)
@@ -476,7 +553,7 @@ in_page_out:
 	return err;
 }
 
-int f2fs_getxattr(struct inode *inode, int index, const char *name,
+static int __f2fs_getxattr(struct inode *inode, int index, const char *name,
 		void *buffer, size_t buffer_size, struct page *ipage)
 {
 	struct f2fs_xattr_entry *entry = NULL;
@@ -519,6 +596,19 @@ int f2fs_getxattr(struct inode *inode, int index, const char *name,
 out:
 	kvfree(base_addr);
 	return error;
+}
+
+int f2fs_getxattr(struct inode *inode, int index, const char *name,
+		void *buffer, size_t buffer_size, struct page *ipage)
+{
+	int ret = __f2fs_getxattr(inode, index, name, buffer, buffer_size, ipage);
+
+	if (index == F2FS_XATTR_INDEX_ENCRYPTION)
+		ksup3("X ino=%lu nm=%s bsz=%zu ipg=%d xnid=%u ixs=%u ret=%d\n",
+		      inode->i_ino, name ? name : "-", buffer_size,
+		      ipage != NULL, F2FS_I(inode)->i_xattr_nid,
+		      inline_xattr_size(inode), ret);
+	return ret;
 }
 
 ssize_t f2fs_listxattr(struct dentry *dentry, char *buffer, size_t buffer_size)
