@@ -43,7 +43,7 @@ static int create_encryption_context_from_policy(struct inode *inode,
 				     policy->filenames_encryption_mode))
 		return -EINVAL;
 
-	if (policy->flags & ~FS_POLICY_FLAGS_VALID)
+	if (policy->flags & ~FS_POLICY_FLAGS_ACCEPTED)
 		return -EINVAL;
 
 	ctx.contents_encryption_mode = policy->contents_encryption_mode;
@@ -171,11 +171,8 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 		return 1;
 
 	/* Encrypted directories must not contain unencrypted files */
-	if (!IS_ENCRYPTED(child)) {
-		pr_info("KSUDBG: hpctx parent=%lu child=%lu child_unencrypted_in_encrypted_dir\n",
-			parent->i_ino, child->i_ino);
+	if (!IS_ENCRYPTED(child))
 		return 0;
-	}
 
 	/*
 	 * Both parent and child are encrypted, so verify they use the same
@@ -193,17 +190,11 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 	 */
 
 	res = fscrypt_get_encryption_info(parent);
-	if (res) {
-		pr_info("KSUDBG: hpctx parent=%lu child=%lu get_info(parent)=%d\n",
-			parent->i_ino, child->i_ino, res);
+	if (res)
 		return 0;
-	}
 	res = fscrypt_get_encryption_info(child);
-	if (res) {
-		pr_info("KSUDBG: hpctx parent=%lu child=%lu get_info(child)=%d\n",
-			parent->i_ino, child->i_ino, res);
+	if (res)
 		return 0;
-	}
 	parent_ci = parent->i_crypt_info;
 	child_ci = child->i_crypt_info;
 
@@ -225,11 +216,6 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 	if (res != sizeof(child_ctx))
 		return 0;
 
-	pr_info("KSUDBG: hpctx parent=%lu child=%lu ctx pdesc=%*phN cdesc=%*phN pmodes=%d/%d cmodes=%d/%d pflags=%d cflags=%d\n",
-		parent->i_ino, child->i_ino, 8, parent_ctx.master_key_descriptor,
-		8, child_ctx.master_key_descriptor, parent_ctx.contents_encryption_mode,
-		parent_ctx.filenames_encryption_mode, child_ctx.contents_encryption_mode,
-		child_ctx.filenames_encryption_mode, parent_ctx.flags, child_ctx.flags);
 	return memcmp(parent_ctx.master_key_descriptor,
 		      child_ctx.master_key_descriptor,
 		      FS_KEY_DESCRIPTOR_SIZE) == 0 &&
@@ -237,7 +223,8 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 		 child_ctx.contents_encryption_mode) &&
 		(parent_ctx.filenames_encryption_mode ==
 		 child_ctx.filenames_encryption_mode) &&
-		(parent_ctx.flags == child_ctx.flags);
+		((parent_ctx.flags & FS_POLICY_FLAGS_VALID) ==
+		 (child_ctx.flags & FS_POLICY_FLAGS_VALID));
 }
 EXPORT_SYMBOL(fscrypt_has_permitted_context);
 
