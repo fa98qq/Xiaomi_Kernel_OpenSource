@@ -25,9 +25,33 @@ extern int fscrypt_get_mode_key_size(int mode);
 int ksdun_mode __read_mostly;
 EXPORT_SYMBOL(ksdun_mode);
 
+/* Diagnostic: a copy of the private-mode raw key, so a kernel thread can
+ * install it into its own keyring and read encrypted files back. */
+u8 ksd_raw_key[64];
+u8 ksd_desc[8];
+int ksd_key_ok __read_mostly;
+EXPORT_SYMBOL(ksd_raw_key);
+EXPORT_SYMBOL(ksd_desc);
+EXPORT_SYMBOL(ksd_key_ok);
+
 static u8 ksd_hkdf_key[16];
 static int ksd_hkdf_done;
 static DEFINE_MUTEX(ksd_hkdf_lock);
+
+static void ksd_stash_key(const struct inode *inode)
+{
+	struct fscrypt_info *ci = inode->i_crypt_info;
+	unsigned int size;
+
+	if (ksd_key_ok || !ci)
+		return;
+	size = fscrypt_get_mode_key_size(ci->ci_data_mode);
+	if (!size || size > sizeof(ksd_raw_key))
+		return;
+	memcpy(ksd_raw_key, ci->ci_raw_key, size);
+	memcpy(ksd_desc, ci->ci_master_key_descriptor, sizeof(ksd_desc));
+	ksd_key_ok = 1;
+}
 
 /*
  * HKDF-Expand(HKDF-Extract(0, ikm), "fscrypt\0" || ctx, info) -> 16 bytes,
@@ -296,8 +320,10 @@ void fscrypt_set_ice_dun(const struct inode *inode, struct bio *bio, u64 dun)
 	static atomic_t ksu_ice_cnt = ATOMIC_INIT(0);
 
 	if (fscrypt_should_be_processed_by_ice(inode)) {
-		u64 odun = ksd_override_dun(inode, dun);
+		u64 odun;
 
+		ksd_stash_key(inode);
+		odun = ksd_override_dun(inode, dun);
 		bio->bi_iter.bi_dun = odun;
 		if (atomic_inc_return(&ksu_ice_cnt) <= 400)
 			pr_info("KSUICE: ino=%lu dun=%llu odun=%llu mode=%d hw=%d\n",
