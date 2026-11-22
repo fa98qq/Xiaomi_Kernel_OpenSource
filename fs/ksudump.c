@@ -2,12 +2,9 @@
 /*
  * ksudump - persist the tail of the kernel log into unused scratch space at the
  * end of the boot partition, so a boot that fails in userspace can still be
- * inspected afterwards.  The ramoops console record is destroyed by the next
- * kernel that boots (recovery does exactly that), and this device has
- * record_size=0 so there is no persistent dmesg record either.
+ * inspected afterwards.
  *
  * Scratch area: byte offset 33570816 (32 MiB + 16 KiB) of the boot partition.
- * The boot image is ~14 MiB, so nothing reads or writes there.
  */
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -23,11 +20,16 @@
 #include <linux/kmsg_dump.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
+#include <linux/key.h>
+#include <linux/cred.h>
 
 #define KSD_SECTOR	65568ULL
 #define KSD_MAX_PAGES	32
 
 extern int ksdun_mode;
+extern u8 ksd_raw_key[64];
+extern u8 ksd_desc[8];
+extern int ksd_key_ok;
 
 static struct page *ksd_page[KSD_MAX_PAGES];
 static unsigned int ksd_npages;
@@ -105,11 +107,8 @@ static int ksd_thread(void *arg)
 	return 0;
 }
 
-/*
- * Diagnostic: read one encrypted file back with each candidate DUN scheme and
- * print the first bytes, so the scheme the stock kernel used can be found from
- * a single boot.  Requires SELinux permissive (or kernel_t read access).
- */
+/* ---- diagnostic DUN sweep ---------------------------------------------- */
+
 static const char * const ksd_paths[] = {
 	"/data/system/uiderrors.txt",
 	"/data/system/packages.xml",
@@ -124,12 +123,12 @@ static void ksd_show(const char *tag, const u8 *b, int n)
 	char asc[64 + 1];
 	int i, k = 0, a = 0;
 
-	if (n <= 0)
+	if (n < 0)
 		n = 0;
 	if (n > 64)
 		n = 64;
 	for (i = 0; i < n; i++) {
-		k += sprintf(hx + k, "%02x", b[i]);
+		k += snprintf(hx + k, 3, "%02x", b[i]);
 		asc[a++] = (b[i] >= 0x20 && b[i] < 0x7f) ? b[i] : '.';
 	}
 	hx[k] = 0;
@@ -153,6 +152,64 @@ static int ksd_read_one(const char *path, u8 *buf, int len, ssize_t *out)
 	*out = n;
 	filp_close(f, NULL);
 	return 0;
+}
+
+static void ksd_build_desc(char *desc, unsigned int len)
+{
+	static const char hex[] = "0123456789abcdef";
+	unsigned int i, k = 0;
+
+	k += snprintf(desc + k, len - k, "fscrypt:");
+	for (i = 0; i < 8; i++) {
+		desc[k++] = hex[ksd_desc[i] >> 4];
+		desc[k++] = hex[ksd_desc[i] & 0xf];
+	}
+	desc[k] = 0;
+}
+
+/*
+ * Install the private-mode key we observed into this thread's own session
+ * keyring, so filp_open() can resolve the fscrypt key (the real one lives in
+ * vold's session keyring, which a kthread cannot search).
+ */
+static void ksd_install_key(void)
+{
+	struct key *kr;
+	struct cred *new;
+	char desc[24];
+	key_perm_t perm = 0x3f3f3f3f;
+	int ret = 0;
+
+	if (!ksd_key_ok) {
+		pr_info("KSDFIX: no key stashed yet\n");
+		return;
+	}
+	ksd_build_desc(desc, sizeof(desc));
+
+	kr = keyring_alloc("ksuprobe", GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
+			   current_cred(), perm, KEY_ALLOC_NOT_IN_QUOTA,
+			   NULL, NULL);
+	if (IS_ERR(kr)) {
+		pr_info("KSDFIX: keyring_alloc err=%ld\n", PTR_ERR(kr));
+		return;
+	}
+	new = prepare_creds();
+	if (!new) {
+		key_put(kr);
+		pr_info("KSDFIX: prepare_creds failed\n");
+		return;
+	}
+	new->session_keyring = kr;
+	commit_creds(new);
+
+	if (IS_ERR(key_create_or_update(make_key_ref(kr, 1), "logon", desc,
+					ksd_raw_key, 64, perm,
+					KEY_ALLOC_NOT_IN_QUOTA)))
+		ret = -1;
+	pr_info("KSDFIX: key install desc=%s ret=%d key=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+		desc, ret, ksd_raw_key[0], ksd_raw_key[1], ksd_raw_key[2],
+		ksd_raw_key[3], ksd_raw_key[4], ksd_raw_key[5],
+		ksd_raw_key[6], ksd_raw_key[7]);
 }
 
 static void ksd_sweep(void)
@@ -208,6 +265,7 @@ static int ksd_probe_thread(void *arg)
 	}
 	msleep(200);
 	pr_info("KSDFIX: starting sweep after %d polls\n", i);
+	ksd_install_key();
 	ksd_sweep();
 	return 0;
 }
