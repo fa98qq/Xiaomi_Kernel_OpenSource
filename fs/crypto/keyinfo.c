@@ -548,7 +548,24 @@ int fscrypt_get_encryption_info(struct inode *inode)
 	if (res)
 		return res;
 
-	res = inode->i_sb->s_cop->get_context(inode, &ctx, sizeof(ctx));
+	{
+		u8 raw[64];
+		int got;
+
+		memset(raw, 0, sizeof(raw));
+		got = inode->i_sb->s_cop->get_context(inode, raw, sizeof(raw));
+		pr_info("KSUDBG2: ino=%lu imode=%o enc=%d getsz=%d raw=%*phN\n",
+			inode->i_ino, inode->i_mode, (int)IS_ENCRYPTED(inode),
+			got, 40, raw);
+		if (got > 0) {
+			memcpy(&ctx, raw,
+			       got < (int)sizeof(ctx) ? got : (int)sizeof(ctx));
+		} else {
+			memset(&ctx, 0, sizeof(ctx));
+		}
+		res = got;
+	}
+
 	if (res < 0) {
 		if (!fscrypt_dummy_context_enabled(inode) ||
 		    IS_ENCRYPTED(inode))
