@@ -11,6 +11,8 @@
  */
 
 #include "fscrypt_ice.h"
+#include <linux/atomic.h>
+#include <linux/printk.h>
 
 extern int fscrypt_get_mode_key_size(int mode);
 
@@ -152,8 +154,15 @@ bool fscrypt_is_ice_encryption_info_equal(const struct inode *inode1,
 
 void fscrypt_set_ice_dun(const struct inode *inode, struct bio *bio, u64 dun)
 {
-	if (fscrypt_should_be_processed_by_ice(inode))
+	static atomic_t ksu_ice_cnt = ATOMIC_INIT(0);
+
+	if (fscrypt_should_be_processed_by_ice(inode)) {
 		bio->bi_iter.bi_dun = dun;
+		if (atomic_inc_return(&ksu_ice_cnt) <= 200)
+			pr_info("KSUICE: ino=%lu dun=%llu hw=%d\n",
+				inode->i_ino, dun,
+				fscrypt_using_hardware_encryption(inode));
+	}
 }
 EXPORT_SYMBOL(fscrypt_set_ice_dun);
 
